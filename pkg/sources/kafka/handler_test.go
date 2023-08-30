@@ -25,13 +25,13 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/IBM/sarama"
+
 	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
-	"github.com/numaproj/numaflow/pkg/forward/applier"
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/isb/stores/simplebuffer"
-	"github.com/numaproj/numaflow/pkg/shared/kvs/noop"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
+	"github.com/numaproj/numaflow/pkg/sources/forward/applier"
 	"github.com/numaproj/numaflow/pkg/watermark/generic"
 	"github.com/numaproj/numaflow/pkg/watermark/store"
 )
@@ -76,7 +76,7 @@ func TestMessageHandling(t *testing.T) {
 		Hostname: "test-host",
 		Replica:  0,
 	}
-	publishWMStore := store.BuildWatermarkStore(noop.NewKVNoOpStore(), noop.NewKVNoOpStore())
+	publishWMStore, _ := store.BuildNoOpWatermarkStore()
 	fetchWatermark, _ := generic.BuildNoOpWatermarkProgressorsFromBufferMap(map[string][]isb.BufferWriter{})
 	toVertexWmStores := map[string]store.WatermarkStore{
 		"test": publishWMStore,

@@ -20,13 +20,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/numaproj/numaflow/pkg/shared/kvs/noop"
-	"github.com/numaproj/numaflow/pkg/watermark/store"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/numaproj/numaflow/pkg/sources/forward/applier"
+	"github.com/numaproj/numaflow/pkg/watermark/store"
 
 	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
-	"github.com/numaproj/numaflow/pkg/forward/applier"
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/isb/stores/simplebuffer"
 	"github.com/numaproj/numaflow/pkg/watermark/generic"
@@ -80,7 +80,7 @@ func Test_NewHTTP(t *testing.T) {
 	toBuffers := map[string][]isb.BufferWriter{
 		"test": {dest},
 	}
-	publishWMStores := store.BuildWatermarkStore(noop.NewKVNoOpStore(), noop.NewKVNoOpStore())
+	publishWMStores, _ := store.BuildNoOpWatermarkStore()
 	fetchWatermark, _ := generic.BuildNoOpWatermarkProgressorsFromBufferMap(map[string][]isb.BufferWriter{})
 	toVertexWmStores := map[string]store.WatermarkStore{
 		"test": publishWMStores,

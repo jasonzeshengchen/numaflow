@@ -19,11 +19,13 @@ package pnf
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	reducepb "github.com/numaproj/numaflow-go/pkg/apis/proto/reduce/v1"
+	"github.com/numaproj/numaflow-go/pkg/apis/proto/reduce/v1/reducemock"
 
 	"github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
@@ -32,9 +34,8 @@ import (
 	"github.com/numaproj/numaflow/pkg/reduce/pbq"
 	"github.com/numaproj/numaflow/pkg/reduce/pbq/partition"
 	"github.com/numaproj/numaflow/pkg/reduce/pbq/store/memory"
-	"github.com/numaproj/numaflow/pkg/sdkclient/udf/clienttest"
+	"github.com/numaproj/numaflow/pkg/sdkclient/reducer"
 	"github.com/numaproj/numaflow/pkg/shared/kvs"
-	"github.com/numaproj/numaflow/pkg/shared/kvs/inmem"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
 	"github.com/numaproj/numaflow/pkg/watermark/generic"
 	"github.com/numaproj/numaflow/pkg/watermark/processor"
@@ -43,20 +44,18 @@ import (
 	"github.com/numaproj/numaflow/pkg/window/keyed"
 
 	"github.com/golang/mock/gomock"
-	functionpb "github.com/numaproj/numaflow-go/pkg/apis/proto/function/v1"
-	"github.com/numaproj/numaflow-go/pkg/apis/proto/function/v1/funcmock"
 	"github.com/stretchr/testify/assert"
 
+	udfcall "github.com/numaproj/numaflow/pkg/udf/rpc"
+
 	"github.com/numaproj/numaflow/pkg/isb/testutils"
-	udfcall "github.com/numaproj/numaflow/pkg/udf/function"
 	wmstore "github.com/numaproj/numaflow/pkg/watermark/store"
 )
 
 const (
 	testPipelineName    = "testPipeline"
 	testProcessorEntity = "publisherTestPod"
-	publisherHBKeyspace = testPipelineName + "_" + testProcessorEntity + "_%s_" + "PROCESSORS"
-	publisherOTKeyspace = testPipelineName + "_" + testProcessorEntity + "_%s_" + "OT"
+	publisherKeyspace   = testPipelineName + "_" + testProcessorEntity + "_%s"
 )
 
 type forwardTest struct {
@@ -143,21 +142,21 @@ func TestProcessAndForward_Process(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockClient := funcmock.NewMockUserDefinedFunctionClient(ctrl)
-	mockReduceClient := funcmock.NewMockUserDefinedFunction_ReduceFnClient(ctrl)
+	mockClient := reducemock.NewMockReduceClient(ctrl)
+	mockReduceClient := reducemock.NewMockReduce_ReduceFnClient(ctrl)
 
 	mockReduceClient.EXPECT().Send(gomock.Any()).Return(nil).AnyTimes()
 	mockReduceClient.EXPECT().CloseSend().Return(nil).AnyTimes()
-	mockReduceClient.EXPECT().Recv().Return(&functionpb.DatumResponseList{
-		Elements: []*functionpb.DatumResponse{
+	mockReduceClient.EXPECT().Recv().Return(&reducepb.ReduceResponse{
+		Results: []*reducepb.ReduceResponse_Result{
 			{
 				Keys:  []string{"reduced_result_key"},
 				Value: []byte(`forward_message`),
 			},
 		},
 	}, nil).Times(1)
-	mockReduceClient.EXPECT().Recv().Return(&functionpb.DatumResponseList{
-		Elements: []*functionpb.DatumResponse{
+	mockReduceClient.EXPECT().Recv().Return(&reducepb.ReduceResponse{
+		Results: []*reducepb.ReduceResponse_Result{
 			{
 				Keys:  []string{"reduced_result_key"},
 				Value: []byte(`forward_message`),
@@ -167,8 +166,8 @@ func TestProcessAndForward_Process(t *testing.T) {
 
 	mockClient.EXPECT().ReduceFn(gomock.Any(), gomock.Any()).Return(mockReduceClient, nil)
 
-	c, _ := clienttest.New(mockClient)
-	client := udfcall.NewUDSgRPCBasedUDFWithClient(c)
+	c, _ := reducer.NewFromClient(mockClient)
+	client := udfcall.NewUDSgRPCBasedReduce(c)
 
 	assert.NoError(t, err)
 	_, publishWatermark := generic.BuildNoOpWatermarkProgressorsFromBufferMap(make(map[string][]isb.BufferWriter))
@@ -455,10 +454,9 @@ func buildPublisherMapAndOTStore(toBuffers map[string][]isb.BufferWriter) (map[s
 	publishers := make(map[string]publish.Publisher)
 	otStores := make(map[string]kvs.KVStorer)
 	for key, partitionedBuffers := range toBuffers {
-		heartbeatKV, _, _ := inmem.NewKVInMemKVStore(ctx, testPipelineName, fmt.Sprintf(publisherHBKeyspace, key))
-		otKV, _, _ := inmem.NewKVInMemKVStore(ctx, testPipelineName, fmt.Sprintf(publisherOTKeyspace, key))
-		otStores[key] = otKV
-		p := publish.NewPublish(ctx, processorEntity, wmstore.BuildWatermarkStore(heartbeatKV, otKV), int32(len(partitionedBuffers)), publish.WithAutoRefreshHeartbeatDisabled(), publish.WithPodHeartbeatRate(1))
+		store, _, _, _ := wmstore.BuildInmemWatermarkStore(ctx, publisherKeyspace)
+		otStores[key] = store.OffsetTimelineStore()
+		p := publish.NewPublish(ctx, processorEntity, store, int32(len(partitionedBuffers)), publish.WithAutoRefreshHeartbeatDisabled(), publish.WithPodHeartbeatRate(1))
 		publishers[key] = p
 	}
 	return publishers, otStores

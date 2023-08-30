@@ -1,3 +1,19 @@
+/*
+Copyright 2022 The Numaproj Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package initializer
 
 import (
@@ -27,10 +43,9 @@ func cleanup(mountPath string) {
 // by reading from the side input bucket.
 func TestSideInputsInitializer_Success(t *testing.T) {
 	var (
-		keyspace     = "sideInputTestWatch"
-		pipelineName = "testPipeline"
-		sideInputs   = []string{"TEST", "TEST2"}
-		dataTest     = []string{"HELLO", "HELLO2"}
+		keyspace   = "sideInputTestWatch"
+		sideInputs = []string{"TEST", "TEST2"}
+		dataTest   = []string{"HELLO", "HELLO2"}
 	)
 	mountPath, err := os.MkdirTemp("", "side-input")
 	assert.NoError(t, err)
@@ -66,7 +81,7 @@ func TestSideInputsInitializer_Success(t *testing.T) {
 	assert.NoError(t, err)
 
 	bucketName := keyspace
-	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, pipelineName, bucketName, nc)
+	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, bucketName, nc)
 	for x := range sideInputs {
 		_, err = kv.Put(sideInputs[x], []byte(dataTest[x]))
 		if err != nil {
@@ -78,14 +93,14 @@ func TestSideInputsInitializer_Success(t *testing.T) {
 
 	for x, sideInput := range sideInputs {
 		p := path.Join(mountPath, sideInput)
-		fileData, err := utils.FetchSideInputFile(p)
+		fileData, err := utils.FetchSideInputFileValue(p)
 		for err != nil {
 			select {
 			case <-ctx.Done():
 				t.Fatalf("Context timeout")
 			default:
 				time.Sleep(10 * time.Millisecond)
-				fileData, err = utils.FetchSideInputFile(p)
+				fileData, err = utils.FetchSideInputFileValue(p)
 			}
 		}
 		assert.Equal(t, dataTest[x], string(fileData))
@@ -97,9 +112,8 @@ func TestSideInputsInitializer_Success(t *testing.T) {
 // write any values to the store
 func TestSideInputsTimeout(t *testing.T) {
 	var (
-		keyspace     = "sideInputTestWatch"
-		pipelineName = "testPipeline"
-		sideInputs   = []string{"TEST", "TEST2"}
+		keyspace   = "sideInputTestWatch"
+		sideInputs = []string{"TEST", "TEST2"}
 	)
 	mountPath, err := os.MkdirTemp("", "side-input")
 	assert.NoError(t, err)
@@ -136,7 +150,7 @@ func TestSideInputsTimeout(t *testing.T) {
 	assert.NoError(t, err)
 
 	bucketName := keyspace
-	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, pipelineName, bucketName, nc)
+	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, bucketName, nc)
 
 	_ = startSideInputInitializer(ctx, sideInputWatcher, mountPath, sideInputs)
 	assert.Equal(t, context.DeadlineExceeded, ctx.Err())

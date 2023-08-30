@@ -20,20 +20,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
-	"k8s.io/apimachinery/pkg/util/wait"
 
 	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
-	"github.com/numaproj/numaflow/pkg/forward/applier"
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/metrics"
 	"github.com/numaproj/numaflow/pkg/shared/idlehandler"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
+	"github.com/numaproj/numaflow/pkg/sources/forward/applier"
 	"github.com/numaproj/numaflow/pkg/watermark/fetch"
 	"github.com/numaproj/numaflow/pkg/watermark/processor"
 	"github.com/numaproj/numaflow/pkg/watermark/publish"
@@ -45,7 +43,7 @@ import (
 type DataForward struct {
 	// I have my reasons for overriding the default principle https://github.com/golang/go/issues/22602
 	ctx context.Context
-	// cancelFn cancels our new context, our cancellation is little more complex and needs to be well orchestrated, hence
+	// cancelFn cancels our new context, our cancellation is a little more complex and needs to be well orchestrated, hence
 	// we need something more than a cancel().
 	cancelFn context.CancelFunc
 	// reader reads data from source.
@@ -53,7 +51,7 @@ type DataForward struct {
 	// toBuffers store the toVertex name to its owned buffers mapping.
 	toBuffers          map[string][]isb.BufferWriter
 	toWhichStepDecider forward.ToWhichStepDecider
-	transformer        applier.MapApplier
+	transformer        applier.SourceTransformApplier
 	wmFetcher          fetch.Fetcher
 	toVertexWMStores   map[string]store.WatermarkStore
 	// toVertexWMPublishers stores the toVertex to publisher mapping.
@@ -74,7 +72,7 @@ func NewDataForward(
 	fromStep isb.BufferReader,
 	toSteps map[string][]isb.BufferWriter,
 	toWhichStepDecider forward.ToWhichStepDecider,
-	transformer applier.MapApplier,
+	transformer applier.SourceTransformApplier,
 	fetchWatermark fetch.Fetcher,
 	srcWMPublisher isb.SourceWatermarkPublisher,
 	toVertexWmStores map[string]store.WatermarkStore,
@@ -166,12 +164,7 @@ func (isdf *DataForward) Start() <-chan struct{} {
 			}
 		}
 
-		// Close the fetcher and all the publishers.
-		err := isdf.wmFetcher.Close()
-		if err != nil {
-			log.Error("Failed to close watermark fetcher, shutdown anyways...", zap.Error(err))
-		}
-
+		// the publisher was created by the forwarder, so it should be closed by the forwarder.
 		for _, toVertexPublishers := range isdf.toVertexWMPublishers {
 			for _, pub := range toVertexPublishers {
 				if err := pub.Close(); err != nil {
@@ -195,11 +188,11 @@ type readWriteMessagePair struct {
 // forwardAChunk forwards a chunk of message from the reader to the toBuffers. It does the Read -> Process -> Forward -> Ack chain
 // for a chunk of messages returned by the first Read call. It will return only if only we are successfully able to ack
 // the message after forwarding, barring any platform errors. The platform errors include buffer-full,
-// buffer-not-reachable, etc., but does not include errors due to user code transformer, WhereTo, etc.
+// buffer-not-reachable, etc., but do not include errors due to user code transformer, WhereTo, etc.
 func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 	start := time.Now()
 	// There is a chance that we have read the message and the container got forcefully terminated before processing. To provide
-	// at-least-once semantics for reading, during restart we will have to reprocess all unacknowledged messages. It is the
+	// at-least-once semantics for reading, during the restart we will have to reprocess all unacknowledged messages. It is the
 	// responsibility of the Read function to do that.
 	readMessages, err := isdf.reader.Read(ctx, isdf.opts.readBatchSize)
 	if err != nil {
@@ -208,8 +201,8 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 	}
 	readMessagesCount.With(map[string]string{metrics.LabelVertex: isdf.vertexName, metrics.LabelPipeline: isdf.pipelineName, metrics.LabelPartitionName: isdf.reader.GetName()}).Add(float64(len(readMessages)))
 
-	// process only if we have any read messages. There is a natural looping here if there is an internal error while
-	// reading, and we are not able to proceed.
+	// Process only if we have any read messages.
+	// There is a natural looping here if there is an internal error while reading, and we are not able to proceed.
 	if len(readMessages) == 0 {
 		return
 	}
@@ -237,7 +230,8 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 	// transformerResults stores the results after user defined transformer processing for all read messages. It indexes
 	// a read message to the corresponding write message
 	transformerResults := make([]readWriteMessagePair, len(readMessages))
-	// applyTransformer, if there is an Internal error it is a blocking call and will return only if shutdown has been initiated.
+	// applyTransformer, if there is an Internal error, it is a blocking call and
+	// will return only if shutdown has been initiated.
 
 	// create a pool of Transformer Processors
 	var wg sync.WaitGroup
@@ -298,20 +292,17 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 	// let's figure out which vertex to send the results to.
 	// update the toBuffer(s) with writeMessages.
 	for _, m := range transformerResults {
-		// look for errors in transformer processing, if we see even 1 error NoAck all messages
-		// then return. Handling partial retrying is not worth ATM.
+		// Look for errors in transformer processing if we see even 1 error we return.
+		// Handling partial retrying is not worth ATM.
 		if m.transformerError != nil {
 			transformerError.With(map[string]string{metrics.LabelVertex: isdf.vertexName, metrics.LabelPipeline: isdf.pipelineName, metrics.LabelPartitionName: isdf.reader.GetName()}).Inc()
 			isdf.opts.logger.Errorw("failed to apply source transformer", zap.Error(m.transformerError))
-			// As there's no partial failure, non-ack all the readOffsets
-			isdf.reader.NoAck(ctx, readOffsets)
 			return
 		}
 		// update toBuffers
 		for _, message := range m.writeMessages {
 			if err := isdf.whereToStep(message, messageToStep, m.readMessage); err != nil {
 				isdf.opts.logger.Errorw("failed in whereToStep", zap.Error(err))
-				isdf.reader.NoAck(ctx, readOffsets)
 				return
 			}
 		}
@@ -319,17 +310,16 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 		sourcePartitionsIndices[m.readMessage.ReadOffset.PartitionIdx()] = true
 	}
 
-	// forward the message to the edge buffer (could be multiple edges)
+	// forward the messages to the edge buffer (could be multiple edges)
 	writeOffsets, err = isdf.writeToBuffers(ctx, messageToStep)
 	if err != nil {
 		isdf.opts.logger.Errorw("failed to write to toBuffers", zap.Error(err))
-		isdf.reader.NoAck(ctx, readOffsets)
 		return
 	}
 
 	// activeWatermarkBuffers records the buffers that the publisher has published
 	// a watermark in this batch processing cycle.
-	// it's used to determine which buffers should receive an idle watermark.
+	// It's used to determine which buffers should receive an idle watermark.
 	// It is created as a slice because it tracks per partition activity info.
 	var activeWatermarkBuffers = make(map[string][]bool)
 	// forward the highest watermark to all the edges to avoid idle edge problem
@@ -359,8 +349,8 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 		}
 	}
 
-	// condition "len(activeWatermarkBuffers) < len(isdf.toVertexWMPublishers)" :
-	// send idle watermark only if we have idle out buffers
+	// condition "len(activeWatermarkBuffers) < len(isdf.toVertexWMPublishers)":
+	// send idle watermark only if we have idled out buffers
 	for toVertexName := range isdf.toVertexWMPublishers {
 		for index, activePartition := range activeWatermarkBuffers[toVertexName] {
 			if !activePartition {
@@ -382,7 +372,7 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 
 	// when we apply transformer, we don't handle partial errors (it's either non or all, non will return early),
 	// so we should be able to ack all the readOffsets including data messages and control messages
-	err = isdf.ackFromBuffer(ctx, readOffsets)
+	err = isdf.ackFromSource(ctx, readOffsets)
 	// implicit return for posterity :-)
 	if err != nil {
 		isdf.opts.logger.Errorw("failed to ack from source", zap.Error(err))
@@ -395,56 +385,14 @@ func (isdf *DataForward) forwardAChunk(ctx context.Context) {
 	forwardAChunkProcessingTime.With(map[string]string{metrics.LabelVertex: isdf.vertexName, metrics.LabelPipeline: isdf.pipelineName, metrics.LabelPartitionName: isdf.reader.GetName()}).Observe(float64(time.Since(start).Microseconds()))
 }
 
-// ackFromBuffer acknowledges an array of offsets back to reader and is a blocking call or until shutdown has been initiated.
-func (isdf *DataForward) ackFromBuffer(ctx context.Context, offsets []isb.Offset) error {
-	var ackRetryBackOff = wait.Backoff{
-		Factor:   1,
-		Jitter:   0.1,
-		Steps:    math.MaxInt,
-		Duration: time.Millisecond * 10,
-	}
-	var ackOffsets = offsets
-	attempt := 0
-
-	ctxClosedErr := wait.ExponentialBackoff(ackRetryBackOff, func() (done bool, err error) {
-		errs := isdf.reader.Ack(ctx, ackOffsets)
-		attempt += 1
-		summarizedErr := errorArrayToMap(errs)
-		var failedOffsets []isb.Offset
-		if len(summarizedErr) > 0 {
-			isdf.opts.logger.Errorw("Failed to ack from buffer, retrying", zap.Any("errors", summarizedErr), zap.Int("attempt", attempt))
-			// no point retrying if ctx.Done has been invoked
-			select {
-			case <-ctx.Done():
-				// no point in retrying after we have been asked to stop.
-				return false, ctx.Err()
-			default:
-				// retry only the failed offsets
-				for i, offset := range ackOffsets {
-					if errs[i] != nil {
-						failedOffsets = append(failedOffsets, offset)
-					}
-				}
-				ackOffsets = failedOffsets
-				if ok, _ := isdf.IsShuttingDown(); ok {
-					ackErr := fmt.Errorf("AckFromBuffer, Stop called while stuck on an internal error, %v", summarizedErr)
-					return false, ackErr
-				}
-				return false, nil
-			}
-		} else {
-			return true, nil
-		}
-	})
-
-	if ctxClosedErr != nil {
-		isdf.opts.logger.Errorw("Context closed while waiting to ack messages inside forward", zap.Error(ctxClosedErr))
-	}
-
-	return ctxClosedErr
+func (isdf *DataForward) ackFromSource(ctx context.Context, offsets []isb.Offset) error {
+	// for all the sources, we either ack all offsets or none.
+	// when a batch ack fails, the source Ack() function populate the error array with the same error;
+	// hence we can just return the first error.
+	return isdf.reader.Ack(ctx, offsets)[0]
 }
 
-// writeToBuffers is a blocking call until all the messages have be forwarded to all the toBuffers, or a shutdown
+// writeToBuffers is a blocking call until all the messages have been forwarded to all the toBuffers, or a shutdown
 // has been initiated while we are stuck looping on an InternalError.
 func (isdf *DataForward) writeToBuffers(
 	ctx context.Context, messageToStep map[string][][]isb.Message,
@@ -484,7 +432,7 @@ func (isdf *DataForward) writeToBuffer(ctx context.Context, toBufferPartition is
 		needRetry := false
 		for idx, msg := range messages {
 			if err := errs[idx]; err != nil {
-				// ATM there are no user defined errors during write, all are InternalErrors.
+				// ATM there are no user-defined errors during writing, all are InternalErrors.
 				if errors.As(err, &isb.NoRetryableBufferWriteErr{}) {
 					// If toBufferPartition returns us a NoRetryableBufferWriteErr, we drop the message.
 					dropBytes += float64(len(msg.Payload))
@@ -516,7 +464,7 @@ func (isdf *DataForward) writeToBuffer(ctx context.Context, toBufferPartition is
 				zap.String(metrics.LabelVertex, isdf.vertexName),
 				zap.String(metrics.LabelPartitionName, toBufferPartition.GetName()),
 			)
-			// set messages to failed for the retry
+			// set messages to the failed slice for the retry
 			messages = failedMessages
 			// TODO: implement retry with backoff etc.
 			time.Sleep(isdf.opts.retryInterval)
@@ -546,17 +494,17 @@ func (isdf *DataForward) concurrentApplyTransformer(ctx context.Context, readMes
 }
 
 // applyTransformer applies the transformer and will block if there is any InternalErr. On the other hand, if this is a UserError
-// the skip flag is set. ShutDown flag will only if there is an InternalErr and ForceStop has been invoked.
+// the skip flag is set. The ShutDown flag will only if there is an InternalErr and ForceStop has been invoked.
 // The UserError retry will be done on the applyTransformer.
 func (isdf *DataForward) applyTransformer(ctx context.Context, readMessage *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	for {
-		writeMessages, err := isdf.transformer.ApplyMap(ctx, readMessage)
+		writeMessages, err := isdf.transformer.ApplyTransform(ctx, readMessage)
 		if err != nil {
 			isdf.opts.logger.Errorw("Transformer.Apply error", zap.Error(err))
 			// TODO: implement retry with backoff etc.
 			time.Sleep(isdf.opts.retryInterval)
 			// keep retrying, I cannot think of a use case where a user could say, errors are fine :-)
-			// as a platform we should not lose or corrupt data.
+			// as a platform, we should not lose or corrupt data.
 			// this does not mean we should prohibit this from a shutdown.
 			if ok, _ := isdf.IsShuttingDown(); ok {
 				isdf.opts.logger.Errorw("Transformer.Apply, Stop called while stuck on an internal error", zap.Error(err))

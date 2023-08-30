@@ -18,21 +18,22 @@ package jetstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/numaproj/numaflow/pkg/shared/kvs"
 	"go.uber.org/zap"
 
 	jsclient "github.com/numaproj/numaflow/pkg/shared/clients/nats"
+	"github.com/numaproj/numaflow/pkg/shared/kvs"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
 )
 
 // jetStreamWatch implements the KV store watcher backed up by Jetstream.
 type jetStreamWatch struct {
 	ctx               context.Context
-	kvBucketName      string
+	kvName            string
 	client            *jsclient.NATSClient
 	kvStore           nats.KeyValue
 	previousFetchTime time.Time
@@ -45,7 +46,7 @@ type jetStreamWatch struct {
 var _ kvs.KVWatcher = (*jetStreamWatch)(nil)
 
 // NewKVJetStreamKVWatch returns KVJetStreamWatch specific to JetStream which implements the KVWatcher interface.
-func NewKVJetStreamKVWatch(ctx context.Context, pipelineName string, kvBucketName string, client *jsclient.NATSClient, opts ...Option) (kvs.KVWatcher, error) {
+func NewKVJetStreamKVWatch(ctx context.Context, kvName string, client *jsclient.NATSClient, opts ...Option) (kvs.KVWatcher, error) {
 
 	kvOpts := defaultOptions()
 
@@ -53,20 +54,20 @@ func NewKVJetStreamKVWatch(ctx context.Context, pipelineName string, kvBucketNam
 		o(kvOpts)
 	}
 
-	kvStore, err := client.BindKVStore(kvBucketName)
+	kvStore, err := client.BindKVStore(kvName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind kv store: %w", err)
 	}
 
 	jsw := &jetStreamWatch{
-		ctx:          ctx,
-		kvBucketName: kvBucketName,
-		client:       client,
-		kvStore:      kvStore,
-		kvwTimer:     time.NewTimer(kvOpts.watcherCreationThreshold),
-		opts:         kvOpts,
-		doneCh:       make(chan struct{}),
-		log:          logging.FromContext(ctx).With("pipeline", pipelineName).With("kvBucketName", kvBucketName),
+		ctx:      ctx,
+		kvName:   kvName,
+		client:   client,
+		kvStore:  kvStore,
+		kvwTimer: time.NewTimer(kvOpts.watcherCreationThreshold),
+		opts:     kvOpts,
+		doneCh:   make(chan struct{}),
+		log:      logging.FromContext(ctx).With("kvName", kvName),
 	}
 	return jsw, nil
 }
@@ -147,14 +148,14 @@ func (jsw *jetStreamWatch) Watch(ctx context.Context) (<-chan kvs.KVEntry, <-cha
 
 				switch value.Operation() {
 				case nats.KeyValuePut:
-					jsw.log.Debug("Received a put event", zap.String("key", value.Key()), zap.String("value", string(value.Value())))
+					jsw.log.Debugw("Received a put event", zap.String("key", value.Key()), zap.Binary("b64Value", value.Value()))
 					updates <- kvEntry{
 						key:   value.Key(),
 						value: value.Value(),
 						op:    kvs.KVPut,
 					}
 				case nats.KeyValueDelete:
-					jsw.log.Debug("Received a delete event", zap.String("key", value.Key()), zap.String("value", string(value.Value())))
+					jsw.log.Debugw("Received a delete event", zap.String("key", value.Key()), zap.Binary("b64Value", value.Value()))
 					updates <- kvEntry{
 						key:   value.Key(),
 						value: value.Value(),
@@ -166,9 +167,9 @@ func (jsw *jetStreamWatch) Watch(ctx context.Context) (<-chan kvs.KVEntry, <-cha
 				kvLastUpdatedTime := jsw.lastUpdateKVTime()
 
 				// if the last update time is zero, it means that there are no key-value pairs in the store yet or ctx was canceled both the cases we should not recreate the watcher
-				// if the last update time is before the previous fetch time, it means that the store is not getting any updates
+				// if the last update time is not after the previous fetch time, it means that the store is not getting any updates (watermark is not getting updated)
 				// therefore, we don't have to recreate the watcher
-				if kvLastUpdatedTime.IsZero() || kvLastUpdatedTime.Before(jsw.previousFetchTime) {
+				if kvLastUpdatedTime.IsZero() || !kvLastUpdatedTime.After(jsw.previousFetchTime) {
 					jsw.log.Debug("The watcher is not receiving any updates, but the store is not getting any updates either", zap.String("watcher", jsw.GetKVName()), zap.Time("lastUpdateKVTime", kvLastUpdatedTime), zap.Time("previousFetchTime", jsw.previousFetchTime))
 				} else {
 					// if the last update time is after the previous fetch time, it means that the store is getting updates but the watcher is not receiving any
@@ -193,7 +194,7 @@ func (jsw *jetStreamWatch) Watch(ctx context.Context) (<-chan kvs.KVEntry, <-cha
 }
 
 func (jsw *jetStreamWatch) newWatcher(ctx context.Context) nats.KeyWatcher {
-	kvWatcher, err := jsw.client.CreateKVWatcher(jsw.kvBucketName, nats.Context(ctx))
+	kvWatcher, err := jsw.client.CreateKVWatcher(jsw.kvName, nats.Context(ctx))
 	// keep looping because the watermark won't work without a watcher
 	for err != nil {
 		select {
@@ -201,7 +202,7 @@ func (jsw *jetStreamWatch) newWatcher(ctx context.Context) nats.KeyWatcher {
 			return nil
 		default:
 			jsw.log.Errorw("Creating watcher failed", zap.String("watcher", jsw.GetKVName()), zap.Error(err))
-			kvWatcher, err = jsw.client.CreateKVWatcher(jsw.kvBucketName)
+			kvWatcher, err = jsw.client.CreateKVWatcher(jsw.kvName)
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
@@ -229,7 +230,7 @@ retryLoop:
 			} else {
 				// if there are no keys in the store, return zero time because there are no updates
 				// upstream will handle it
-				if err == nats.ErrNoKeysFound {
+				if errors.Is(err, nats.ErrNoKeysFound) {
 					return time.Time{}
 				}
 				jsw.log.Errorw("Failed to get keys", zap.String("watcher", jsw.GetKVName()), zap.Error(err))
@@ -260,7 +261,7 @@ retryLoop:
 
 // GetKVName returns the KV store (bucket) name.
 func (jsw *jetStreamWatch) GetKVName() string {
-	return jsw.kvBucketName
+	return jsw.kvName
 }
 
 // Close send a signal to all the watchers to stop.

@@ -23,15 +23,14 @@ import (
 	"time"
 
 	natslib "github.com/nats-io/nats.go"
-	"github.com/numaproj/numaflow/pkg/shared/kvs/noop"
 	"github.com/stretchr/testify/assert"
 
 	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
-	"github.com/numaproj/numaflow/pkg/forward/applier"
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/isb/stores/simplebuffer"
 	natstest "github.com/numaproj/numaflow/pkg/shared/clients/nats/test"
+	"github.com/numaproj/numaflow/pkg/sources/forward/applier"
 	"github.com/numaproj/numaflow/pkg/watermark/generic"
 	"github.com/numaproj/numaflow/pkg/watermark/store"
 )
@@ -77,7 +76,7 @@ func newInstance(t *testing.T, vi *dfv1.VertexInstance) (*natsSource, error) {
 		"test": {dest},
 	}
 
-	publishWMStores := store.BuildWatermarkStore(noop.NewKVNoOpStore(), noop.NewKVNoOpStore())
+	publishWMStores, _ := store.BuildNoOpWatermarkStore()
 	fetchWatermark, _ := generic.BuildNoOpWatermarkProgressorsFromBufferMap(map[string][]isb.BufferWriter{})
 	toVertexWmStores := map[string]store.WatermarkStore{
 		"testVertex": publishWMStores,

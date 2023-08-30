@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	sinkpb "github.com/numaproj/numaflow-go/pkg/apis/proto/sink/v1"
+
 	dfv1 "github.com/numaproj/numaflow/pkg/apis/numaflow/v1alpha1"
 	"github.com/numaproj/numaflow/pkg/forward"
 	"github.com/numaproj/numaflow/pkg/forward/applier"
@@ -38,7 +39,7 @@ type UserDefinedSink struct {
 	pipelineName string
 	isdf         *forward.InterStepDataForward
 	logger       *zap.SugaredLogger
-	udsink       *UDSgRPCBasedUDSink
+	udsink       SinkApplier
 }
 
 type Option func(*UserDefinedSink) error
@@ -56,7 +57,7 @@ func NewUserDefinedSink(vertex *dfv1.Vertex,
 	fetchWatermark fetch.Fetcher,
 	publishWatermark map[string]publish.Publisher,
 	whereToDecider forward.GoWhere,
-	udsink *UDSgRPCBasedUDSink,
+	udsink SinkApplier,
 	opts ...Option) (*UserDefinedSink, error) {
 
 	s := new(UserDefinedSink)
@@ -80,7 +81,7 @@ func NewUserDefinedSink(vertex *dfv1.Vertex,
 	}
 	s.udsink = udsink
 
-	isdf, err := forward.NewInterStepDataForward(vertex, fromBuffer, map[string][]isb.BufferWriter{vertex.Spec.Name: {s}}, whereToDecider, applier.Terminal, fetchWatermark, publishWatermark, forwardOpts...)
+	isdf, err := forward.NewInterStepDataForward(vertex, fromBuffer, map[string][]isb.BufferWriter{vertex.Spec.Name: {s}}, whereToDecider, applier.Terminal, applier.TerminalMapStream, fetchWatermark, publishWatermark, forwardOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -104,18 +105,18 @@ func (s *UserDefinedSink) IsFull() bool {
 
 // Write writes to the UDSink container.
 func (s *UserDefinedSink) Write(ctx context.Context, messages []isb.Message) ([]isb.Offset, []error) {
-	msgs := make([]*sinkpb.DatumRequest, len(messages))
+	msgs := make([]*sinkpb.SinkRequest, len(messages))
 	for i, m := range messages {
-		msgs[i] = &sinkpb.DatumRequest{
-			// NOTE: key is not used anywhere ATM
+		msgs[i] = &sinkpb.SinkRequest{
 			Id:        m.ID,
 			Value:     m.Payload,
-			EventTime: &sinkpb.EventTime{EventTime: timestamppb.New(m.EventTime)},
+			Keys:      m.Keys,
+			EventTime: timestamppb.New(m.EventTime),
 			// Watermark is only available in readmessage....
-			Watermark: &sinkpb.Watermark{Watermark: timestamppb.New(time.Time{})}, // TODO: insert the correct watermark
+			Watermark: timestamppb.New(time.Time{}), // TODO: insert the correct watermark
 		}
 	}
-	return nil, s.udsink.Apply(ctx, msgs)
+	return nil, s.udsink.ApplySink(ctx, msgs)
 }
 
 func (s *UserDefinedSink) Close() error {

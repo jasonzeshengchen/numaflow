@@ -1,3 +1,19 @@
+/*
+Copyright 2022 The Numaproj Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package synchronizer
 
 import (
@@ -27,10 +43,9 @@ func cleanup(mountPath string) {
 // side input store path with updated values from the side input bucket.
 func TestSideInputsValueUpdates(t *testing.T) {
 	var (
-		keyspace     = "sideInputTestWatch"
-		pipelineName = "testPipeline"
-		sideInputs   = []string{"TEST", "TEST2"}
-		dataTest     = []string{"HELLO", "HELLO2"}
+		keyspace   = "sideInputTestWatch"
+		sideInputs = []string{"TEST", "TEST2"}
+		dataTest   = []string{"HELLO", "HELLO2"}
 	)
 	mountPath, err := os.MkdirTemp("/tmp", "side-input")
 	assert.NoError(t, err)
@@ -77,7 +92,7 @@ func TestSideInputsValueUpdates(t *testing.T) {
 	}
 
 	bucketName := keyspace
-	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, pipelineName, bucketName, nc)
+	sideInputWatcher, _ := jetstream.NewKVJetStreamKVWatch(ctx, bucketName, nc)
 	go startSideInputSynchronizer(ctx, sideInputWatcher, mountPath)
 	for x := range sideInputs {
 		_, err = kv.Put(sideInputs[x], []byte(dataTest[x]))
@@ -88,14 +103,14 @@ func TestSideInputsValueUpdates(t *testing.T) {
 
 	for x, sideInput := range sideInputs {
 		p := path.Join(mountPath, sideInput)
-		fileData, err := utils.FetchSideInputFile(p)
+		fileData, err := utils.FetchSideInputFileValue(p)
 		for err != nil {
 			select {
 			case <-ctx.Done():
 				t.Fatalf("Context timeout")
 			default:
 				time.Sleep(10 * time.Millisecond)
-				fileData, err = utils.FetchSideInputFile(p)
+				fileData, err = utils.FetchSideInputFileValue(p)
 			}
 		}
 		assert.Equal(t, dataTest[x], string(fileData))

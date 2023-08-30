@@ -31,10 +31,8 @@ import (
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/isb/stores/simplebuffer"
 	"github.com/numaproj/numaflow/pkg/isb/testutils"
-	"github.com/numaproj/numaflow/pkg/shared/kvs/inmem"
-	"github.com/numaproj/numaflow/pkg/shared/kvs/noop"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
-	udfapplier "github.com/numaproj/numaflow/pkg/udf/function"
+	udfapplier "github.com/numaproj/numaflow/pkg/udf/rpc"
 	"github.com/numaproj/numaflow/pkg/watermark/generic"
 	wmstore "github.com/numaproj/numaflow/pkg/watermark/store"
 	"github.com/numaproj/numaflow/pkg/watermark/wmb"
@@ -46,8 +44,7 @@ import (
 const (
 	testPipelineName    = "testPipeline"
 	testProcessorEntity = "publisherTestPod"
-	publisherHBKeyspace = testPipelineName + "_" + testProcessorEntity + "_%s_" + "PROCESSORS"
-	publisherOTKeyspace = testPipelineName + "_" + testProcessorEntity + "_%s_" + "OT"
+	publishKeyspace     = testPipelineName + "_" + testProcessorEntity + "_%s"
 )
 
 var (
@@ -57,11 +54,6 @@ var (
 
 type testForwardFetcher struct {
 	// for data_forward_test.go only
-}
-
-func (t *testForwardFetcher) Close() error {
-	// won't be used
-	return nil
 }
 
 func TestMain(m *testing.M) {
@@ -93,12 +85,8 @@ func (f myForwardTest) WhereTo(_ []string, _ []string) ([]forward.VertexBuffer, 
 	}}, nil
 }
 
-func (f myForwardTest) ApplyMap(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f myForwardTest) ApplyTransform(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return testutils.CopyUDFTestApply(ctx, message)
-}
-
-func (f myForwardTest) ApplyMapStream(ctx context.Context, message *isb.ReadMessage, writeMessageCh chan<- isb.WriteMessage) error {
-	return testutils.CopyUDFTestApplyStream(ctx, message, writeMessageCh)
 }
 
 func TestNewDataForward(t *testing.T) {
@@ -178,7 +166,19 @@ func TestNewDataForward(t *testing.T) {
 					assert.Equal(t, []interface{}{writeMessages[j].Body}, []interface{}{readMessages[i].Body})
 				}
 			}
-			validateMetrics(t, batchSize)
+
+			// iterate to see whether metrics will eventually succeed
+			err = validateMetrics(batchSize)
+			for err != nil {
+				select {
+				case <-ctx.Done():
+					t.Errorf("failed waiting metrics collection to succeed [%s] (%s)", ctx.Err(), err)
+				default:
+					time.Sleep(10 * time.Millisecond)
+					err = validateMetrics(batchSize)
+				}
+			}
+
 			// write some data
 			_, errs = fromStep.Write(ctx, writeMessages[batchSize:4*batchSize])
 			assert.Equal(t, make([]error, 3*batchSize), errs)
@@ -777,7 +777,7 @@ func (f *mySourceForwardTestRoundRobin) WhereTo(_ []string, _ []string) ([]forwa
 // such that we can verify message IsLate attribute gets set to true.
 var testSourceNewEventTime = testSourceWatermark.Add(time.Duration(-1) * time.Minute)
 
-func (f mySourceForwardTest) ApplyMap(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f mySourceForwardTest) ApplyTransform(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return func(ctx context.Context, readMessage *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 		_ = ctx
 		offset := readMessage.ReadOffset
@@ -804,39 +804,6 @@ func (f mySourceForwardTest) ApplyMap(ctx context.Context, message *isb.ReadMess
 		}
 		return []*isb.WriteMessage{{Message: writeMessage}}, nil
 	}(ctx, message)
-}
-
-func (f mySourceForwardTest) ApplyMapStream(ctx context.Context, message *isb.ReadMessage, writeMessageCh chan<- isb.WriteMessage) error {
-	return func(ctx context.Context, readMessage *isb.ReadMessage, writeMessages chan<- isb.WriteMessage) error {
-		defer close(writeMessages)
-
-		_ = ctx
-		offset := readMessage.ReadOffset
-		payload := readMessage.Body.Payload
-		parentPaneInfo := readMessage.MessageInfo
-
-		// apply source data transformer
-		_ = payload
-		// copy the payload
-		result := payload
-		// assign new event time
-		parentPaneInfo.EventTime = testSourceNewEventTime
-		var key []string
-
-		writeMessage := isb.Message{
-			Header: isb.Header{
-				MessageInfo: parentPaneInfo,
-				ID:          offset.String(),
-				Keys:        key,
-			},
-			Body: isb.Body{
-				Payload: result,
-			},
-		}
-
-		writeMessages <- isb.WriteMessage{Message: writeMessage}
-		return nil
-	}(ctx, message, writeMessageCh)
 }
 
 // TestSourceWatermarkPublisher is a dummy implementation of isb.SourceWatermarkPublisher interface
@@ -1062,12 +1029,8 @@ func (f myForwardDropTest) WhereTo(_ []string, _ []string) ([]forward.VertexBuff
 	return []forward.VertexBuffer{}, nil
 }
 
-func (f myForwardDropTest) ApplyMap(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f myForwardDropTest) ApplyTransform(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return testutils.CopyUDFTestApply(ctx, message)
-}
-
-func (f myForwardDropTest) ApplyMapStream(ctx context.Context, message *isb.ReadMessage, writeMessageCh chan<- isb.WriteMessage) error {
-	return testutils.CopyUDFTestApplyStream(ctx, message, writeMessageCh)
 }
 
 type myForwardToAllTest struct {
@@ -1087,12 +1050,8 @@ func (f *myForwardToAllTest) WhereTo(_ []string, _ []string) ([]forward.VertexBu
 	return output, nil
 }
 
-func (f *myForwardToAllTest) ApplyMap(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f *myForwardToAllTest) ApplyTransform(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return testutils.CopyUDFTestApply(ctx, message)
-}
-
-func (f myForwardToAllTest) ApplyMapStream(ctx context.Context, message *isb.ReadMessage, writeMessageCh chan<- isb.WriteMessage) error {
-	return testutils.CopyUDFTestApplyStream(ctx, message, writeMessageCh)
 }
 
 type myForwardInternalErrTest struct {
@@ -1105,20 +1064,8 @@ func (f myForwardInternalErrTest) WhereTo(_ []string, _ []string) ([]forward.Ver
 	}}, nil
 }
 
-func (f myForwardInternalErrTest) ApplyMap(_ context.Context, _ *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f myForwardInternalErrTest) ApplyTransform(_ context.Context, _ *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return nil, udfapplier.ApplyUDFErr{
-		UserUDFErr: false,
-		InternalErr: struct {
-			Flag        bool
-			MainCarDown bool
-		}{Flag: true, MainCarDown: false},
-		Message: "InternalErr test",
-	}
-}
-
-func (f myForwardInternalErrTest) ApplyMapStream(_ context.Context, _ *isb.ReadMessage, writeMessagesCh chan<- isb.WriteMessage) error {
-	close(writeMessagesCh)
-	return udfapplier.ApplyUDFErr{
 		UserUDFErr: false,
 		InternalErr: struct {
 			Flag        bool
@@ -1138,12 +1085,8 @@ func (f myForwardApplyWhereToErrTest) WhereTo(_ []string, _ []string) ([]forward
 	}}, fmt.Errorf("whereToStep failed")
 }
 
-func (f myForwardApplyWhereToErrTest) ApplyMap(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f myForwardApplyWhereToErrTest) ApplyTransform(ctx context.Context, message *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return testutils.CopyUDFTestApply(ctx, message)
-}
-
-func (f myForwardApplyWhereToErrTest) ApplyMapStream(ctx context.Context, message *isb.ReadMessage, writeMessageCh chan<- isb.WriteMessage) error {
-	return testutils.CopyUDFTestApplyStream(ctx, message, writeMessageCh)
 }
 
 type myForwardApplyTransformerErrTest struct {
@@ -1156,16 +1099,11 @@ func (f myForwardApplyTransformerErrTest) WhereTo(_ []string, _ []string) ([]for
 	}}, nil
 }
 
-func (f myForwardApplyTransformerErrTest) ApplyMap(_ context.Context, _ *isb.ReadMessage) ([]*isb.WriteMessage, error) {
+func (f myForwardApplyTransformerErrTest) ApplyTransform(_ context.Context, _ *isb.ReadMessage) ([]*isb.WriteMessage, error) {
 	return nil, fmt.Errorf("transformer error")
 }
 
-func (f myForwardApplyTransformerErrTest) ApplyMapStream(_ context.Context, _ *isb.ReadMessage, writeMessagesCh chan<- isb.WriteMessage) error {
-	close(writeMessagesCh)
-	return fmt.Errorf("transformer error")
-}
-
-func validateMetrics(t *testing.T, batchSize int64) {
+func validateMetrics(batchSize int64) (err error) {
 	metadata := `
 		# HELP source_forwarder_read_total Total number of Messages Read
 		# TYPE source_forwarder_read_total counter
@@ -1174,9 +1112,9 @@ func validateMetrics(t *testing.T, batchSize int64) {
 		source_forwarder_read_total{partition_name="from",pipeline="testPipeline",vertex="testVertex"} ` + fmt.Sprintf("%f", float64(batchSize)) + `
 	`
 
-	err := testutil.CollectAndCompare(readMessagesCount, strings.NewReader(metadata+expected), "source_forwarder_read_total")
+	err = testutil.CollectAndCompare(readMessagesCount, strings.NewReader(metadata+expected), "source_forwarder_read_total")
 	if err != nil {
-		t.Errorf("unexpected collecting result:\n%s", err)
+		return err
 	}
 
 	writeMetadata := `
@@ -1198,7 +1136,7 @@ func validateMetrics(t *testing.T, batchSize int64) {
 
 	err = testutil.CollectAndCompare(writeMessagesCount, strings.NewReader(writeMetadata+writeExpected), "source_forwarder_write_total")
 	if err != nil {
-		t.Errorf("unexpected collecting result:\n%s", err)
+		return err
 	}
 
 	ackMetadata := `
@@ -1211,8 +1149,10 @@ func validateMetrics(t *testing.T, batchSize int64) {
 
 	err = testutil.CollectAndCompare(ackMessagesCount, strings.NewReader(ackMetadata+ackExpected), "source_forwarder_ack_total")
 	if err != nil {
-		t.Errorf("unexpected collecting result:\n%s", err)
+		return err
 	}
+
+	return nil
 }
 
 func metricsReset() {
@@ -1226,9 +1166,8 @@ func buildToVertexWatermarkStores(toBuffers map[string][]isb.BufferWriter) map[s
 	var ctx = context.Background()
 	otStores := make(map[string]wmstore.WatermarkStore)
 	for key := range toBuffers {
-		heartbeatKV, _, _ := inmem.NewKVInMemKVStore(ctx, testPipelineName, fmt.Sprintf(publisherHBKeyspace, key))
-		otKV, _, _ := inmem.NewKVInMemKVStore(ctx, testPipelineName, fmt.Sprintf(publisherOTKeyspace, key))
-		otStores[key] = wmstore.BuildWatermarkStore(heartbeatKV, otKV)
+		store, _, _, _ := wmstore.BuildInmemWatermarkStore(ctx, fmt.Sprintf(publishKeyspace, key))
+		otStores[key] = store
 	}
 	return otStores
 }
@@ -1236,7 +1175,7 @@ func buildToVertexWatermarkStores(toBuffers map[string][]isb.BufferWriter) map[s
 func buildNoOpToVertexStores(toBuffers map[string][]isb.BufferWriter) map[string]wmstore.WatermarkStore {
 	toVertexStores := make(map[string]wmstore.WatermarkStore)
 	for key := range toBuffers {
-		store := wmstore.BuildWatermarkStore(noop.NewKVNoOpStore(), noop.NewKVNoOpStore())
+		store, _ := wmstore.BuildNoOpWatermarkStore()
 		toVertexStores[key] = store
 	}
 	return toVertexStores
